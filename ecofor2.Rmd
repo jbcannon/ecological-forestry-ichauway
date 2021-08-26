@@ -1,0 +1,926 @@
+---
+title: "Ecological Forestry Analysis 2"
+author: "Jeffery B. Cannon"
+date: "6/10/2021"
+bibliography: "ecofor2.bib"
+email: Jeffery.Cannon@jonesctr.org
+output: 
+  bookdown::pdf_document2: 
+    keep_md: yes
+header-includes:
+   - \usepackage{booktabs}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE, cache=TRUE, dev='png', dpi=600)
+```
+
+# Purpose
+
+The goal of this script is to analyze overstory data from the ecological forestry experiment at the Jones Center at Ichauway. Briefly, the experiment began in 2009 when 4 silvicultural treatments varying in spatial pattern were implemented in 18 4 ha mapped longleaf pine dominated stands. The stands were mapped, identified and measured in 2009 (pre-treatment), 2010 (post-treatment), 2014, and 2019.
+
+The objectives of the analysis are to:
+
+* determine the extent to which the treatments vary in structure (BA, density, volume, *Dq*)
+* determine how rates of regeneration and mortality differ among treatments
+* determine how treatments vary in spatial structure
+* determine how regeneration and mortality processes vary spatially among treatments
+
+# Data cleanup and summary
+
+```{r io-setup, warning = FALSE, message = FALSE, results = 'hide', cache=FALSE}
+packages <- c('rgdal', 'raster', 'reshape', 'plyr', 'lme4', 'car', 'nlme', 'knitr', 'bookdown', 'spatstat',
+              'maptools', 'RColorBrewer', 'rgeos', 'pdftools')
+for(package in packages){
+  if(suppressMessages(!require(package,character.only=TRUE))){
+    install.packages(package)
+    suppressMessages(library(package,character.only=T))
+  }
+}
+
+data(longleaf)
+
+```
+
+```{r io-load, echo = FALSE, warning = FALSE}
+trees09 = readOGR('../trees_cleaned/trees09.shp', verbose=FALSE)
+trees10 = readOGR('../trees_cleaned/trees10.shp', verbose=FALSE)
+trees14 = readOGR('../trees_cleaned/trees14.shp', verbose=FALSE)
+trees18 = readOGR('../trees_cleaned/trees18.shp', verbose=FALSE)
+proj4string(trees18) = proj4string(trees14)
+plots_bnd = readOGR('../shp/ecoforplots.shp', verbose=FALSE)
+results_filebase = 'results_' #define filename base for outputs
+```
+
+* Create tabular summary of treatments for easy merging/analysis
+
+```{r trt-sum, echo = FALSE}
+plots_bnd$Treatment = as.factor(plots_bnd$Treatment)
+levels(plots_bnd$Treatment) = c('Control', 'Group', 'Group+reserves', 'Individual')
+trt_tab = plots_bnd@data[, c('PlotID', 'Treatment', 'Block')]
+colnames(trt_tab)[1] = 'PLOT'
+trt_tab$PLOT = as.factor(trt_tab$PLOT)
+trt_tab$Block = as.factor(trt_tab$Block) 
+trt_tab = trt_tab[with(trt_tab, order(Block, PLOT)), ]
+
+kable(trt_tab, row.names= FALSE, caption = 'Experimental design summary\n', format = 'pipe', booktabs=TRUE)
+```
+
+* Create a master tree list from all observation years for quick summary of data by year
+
+```{r data-cleanup1, cache = TRUE}
+trees09$year = 2009
+trees10$year = 2010
+trees14$year = 2014
+trees18$year = 2018
+trees = rbind(trees09, trees10, trees14, trees18)
+trees$PLOT = as.numeric(trees$PLOT)
+trees$NOTES = NULL
+trees$PLOT = as.factor(trees$PLOT)
+
+kable(head(trees@data, 15), caption = 'Example data of master tree list', format='pipe', booktabs=TRUE)
+
+```
+
+* Identify recruitment and mortality events
+
+```{r data-cleanup, cache = TRUE, echo = FALSE, results = 'asis'}
+x = melt(trees@data, id.var = c('PLOT', 'TAGNO', 'SPECIES', 'year'))
+x = cast(x, PLOT + TAGNO + SPECIES ~ variable + year, fun.aggregate = function(x) x[1])
+x$r_yr = NA
+x$r_yr = with(x, ifelse(is.na(DBH_2010) & !is.na(DBH_2014), 2014, r_yr))
+x$r_yr = with(x, ifelse(is.na(DBH_2010) & is.na(DBH_2014) & !is.na(DBH_2018), 2018, r_yr))
+x$r_yr = as.factor(x$r_yr)
+
+x$m_yr = NA
+x$m_yr = with(x, ifelse(!is.na(DBH_2010) & is.na(DBH_2014), 2014, m_yr))
+x$m_yr = with(x, ifelse(!is.na(DBH_2010) & !is.na(DBH_2014) & is.na(DBH_2018), 2018, m_yr))
+x$m_yr = as.factor(x$m_yr)
+
+x1 = with(x, table(m_yr, exclude = FALSE))
+kable(x1, align='l', format='pipe', caption = 'Number of mortality events noted in 2014 and 2018', label='mort-event', booktabs=TRUE)
+
+x1 = with(x, table(r_yr, exclude = FALSE))
+kable(x1, align = 'l', format='pipe', caption = 'Number of recruitment events noted in 2014 and 2018', label='rec-event', booktabs=TRUE)
+
+wide_table = x
+
+```
+
+* Setup and apply basal area and biomass functions
+
+I set up several functions to aid in calculation of forest metrics. Two functions aid with calculation of timber volume for longleaf pine. The functions derived from @Gonzalez-Benecke2014 are `Vib4()` and `Vib1()`. V~IB~4 is the stem volume inside bark when dbh and H (height) are known. V~IB~1 is the stem volume inside bark when only dbh is known. I also calculated quadratic mean diameter using the summation method [@Shaw2000].
+
+```{r fxn-setup}
+BAcontrib = function(dbh_cm, area_ha) {(dbh_cm/200)^2 * pi / (area_ha)}
+
+Vib4 = function(dbh_cm, ht_m, pars = c(3.1e-5, 1.917270, 1.072289 )) {
+  d=pars
+  v=d[1] * dbh_cm^d[2] * ht_m^d[3]
+  return(v)
+}
+
+Vib1 = function(dbh_cm, pars = c(0.000264, 2.260839)) {
+  d=pars
+  v=d[1] * dbh_cm^d[2]
+  return(v)
+}
+
+Dq = function(dbh_cm) sqrt(sum(dbh_cm^2)/length(dbh_cm))
+```
+
+```{r ba-vol-calc, cache = TRUE, fig.cap='Histogram of tree volume calculated within Ecological forestry plots', fig.width=3, fig.height=3}
+trees$vol_m3 = with(trees@data, Vib4(DBH, HEIGHT))
+trees$ba = with(trees@data, BAcontrib(DBH, 4))
+trees$vol_m3[trees$SPECIES != 'PIPA'] = 0
+par(mar=c(4,4,0,0))
+hist(trees$vol_m3, xlab = 'Volume (m3)', xlim = c(0,4), breaks = 100, main = '')
+
+```
+
+```{r spp-comp}
+x = ddply(subset(trees,year==2009)@data, .(SPECIES), summarize, ba = sum(ba)/18, .drop=FALSE)
+x=x[order(-x$ba),]
+x$p = x$ba / sum(x$ba)*100
+kable(x, digits = c(NA,2,1), row.names=FALSE, caption = "Species composition of overstory trees based on basal area (m$^2$ ha$^{-1}$) and proportion of basal area.", format='pipe')
+
+x = ddply(subset(trees,year==2009)@data, .(PLOT), summarize, PIPA_ba = sum(ba * as.numeric(SPECIES=='PIPA')), tot_ba = sum(ba), p = PIPA_ba/tot_ba*100)
+x = x[order(-x$p),]
+kable(x, row.names=FALSE, digits=c(NA,2,2,1), caption = 'Percent composition of longleaf pine by plot based on basal area', format='pipe')
+
+
+```
+
+\newpage
+
+# Non-spatial structural changes
+
+## Calculate density changes by plot
+
+```{r dens-by-plot, echo = FALSE}
+dens_summary = ddply(trees@data, .(PLOT, year), summarize,
+      dens_ha = length(DBH)/4,
+      ba_ha = sum(ba),
+      pipa_vol_ha = sum(vol_m3/4),
+      dq = Dq(DBH))
+
+dens_summary = merge(dens_summary, trt_tab)
+dens_summary$rel_year = dens_summary$year - 2010
+dens_summary$PLOT = as.factor(dens_summary$PLOT)
+dens_summary$Block = as.factor(dens_summary$Block)
+dens_summary$year = as.factor(dens_summary$year)
+dens_summary$rel_year = as.factor(dens_summary$rel_year)
+dens_summary = dens_summary[with(dens_summary, order(Treatment, PLOT)),]
+
+kable(dens_summary, align='c', row.names=FALSE, format='pipe', caption = 'Changes in non-spatial structural metrics by plot and year. Column `rel_year` represents number of years prior to treatment implementation (2010).', digits = c(0,0,2,2,2,2,0,0,0))
+```
+
+## Harvest summary
+
+```{r harvest-summary, cache = TRUE, results = 'hide'}
+
+#summarize the cut
+x = dens_summary
+x = subset(x, Treatment != 'Control' & year %in% 2009:2010)
+
+#BA removal ranged from 7.8% to 21.2%
+tmp = ddply(x, .(PLOT), summarize, rm = (ba_ha[2] - ba_ha[1])/ba_ha[1])
+mean(tmp$rm); sd(tmp$rm); range(tmp$rm)
+
+# Range of basal area within blocks
+x = ddply(subset(x, rel_year == 0), .(Block), summarize, ba_range = diff(
+range(ba_ha)))
+mean(x$ba_range); sd(x$ba_range)
+
+# Output summary table by treatments
+x = ddply(dens_summary, .(Treatment, year, rel_year), summarize, ba_mn = mean(ba_ha), ba_sd = sd(ba_ha), vol_mn = mean(pipa_vol_ha), vol_sd=sd(pipa_vol_ha), dens_mn = mean(dens_ha), dens_sd = sd(dens_ha), dq_mn = mean(dq), dq_sd = sd(dq))
+
+knitr::kable(ddply(subset(x, rel_year %in% -1:0 & Treatment != 'Control'), .(rel_year), summarize, ba = mean(ba_mn), dens = mean(dens_mn), vol = mean(vol_mn)), digits = c(NA, 1,1,1), caption='Change in structural metrics for all years')
+
+knitr::kable(subset(x, rel_year %in% -1:0), digits = c(NA, NA, 1,1,1,1,1,1), caption = 'Change in structural metrics between 2009 and 2010')
+
+#export complete table for paper
+for(i in 4:11) x[,i] = round(x[,i], 1)
+for(i in c(4,6,8,10)) x[,i] = paste0(x[,i], ' (', x[,i+1], ')')
+x = x[, -c(5,7,9,11)]
+knitr::kable(x, caption='Change in structural metrics across years for all treatments')
+write.csv(x, '../tab/dens-summary.csv', row.names=FALSE)
+```
+
+To characterize the impact of the 2009 harvest, I calculated several changes including change in basal area by plot, residual basal area by plot.
+
+Basal area removed from plots was `r round(mean(tmp$rm),3)*100` \% $\pm$ `r round(sd(tmp$rm),3)*100` \% and ranged from `r round(max(tmp$rm),3)*100` \% to `r round(min(tmp$rm),3)*100` \% removed. Residual basal area was relatively consistent within blocks, with a mean within-block basal area  had a range of `r round(mean(x$ba_range),2)` $\pm$  `r round(sd(x$ba_range),2)` m^2^ ha^-1^.
+
+## Analysis of structural changes
+
+### Harvest effects
+
+First I'd like to analyze effects of harvest on main structural metrics including stem density, basal area, *P. palustris* volume, and *Dq*. I will use repeated measures ANOVA on the 2009 and 2010 comparisons to show effects of harvest. to test whether treatments differentially changed elements of forest structure, I will include a random effect for plot, block effect, and Treatment $\times$ year interaction.
+
+```{r dens-analysis, cache= TRUE, results='asis'}
+
+var = c('ba_ha', 'pipa_vol_ha', 'dens_ha', 'dq')
+
+for(v in var) {
+  f = paste(v, '~ Treatment * year + (1|PLOT) + Block')
+  x = lmer(f, data=subset(dens_summary, year %in% c(2009,2010)))
+  x = Anova(x, type = 'III')
+  v = gsub('_', '-', v)
+  print(kable(x, format='pipe', caption = paste('ANOVA table of effects for changes in ', v, 'following treatments.'), digits=c(2,0,3), label=paste0(v,'-trteffect', booktabs=TRUE)))
+
+}
+
+```
+
+```{r wade-summary, resuts='asis'}
+wade_dat = data.frame(x = longleaf$x, y=longleaf$y, dbh=longleaf$marks)
+wade_dat = subset(wade_dat, dbh >= 10)
+wade = list()
+wade$owin = longleaf$window
+wade$area = (diff(wade$owin$xrange) * diff(wade$owin$xrange))/10000
+wade$dens_ha = nrow(wade_dat)  / wade$area
+wade$ba_ha = sum(with(wade_dat, pi*(dbh/200)^2) / wade$area)
+wade$dq = Dq(wade_dat$dbh)
+wade$pipa_vol_ha = sum(Vib1(wade_dat$dbh)) / wade$area
+wade$ppp = as.ppp(coordinates(wade_dat[,1:2]), W = wade$owin)
+wade$marks = wade_dat$dbh
+```
+
+Overall, I found that treatments showed significant treatment $\times$ year interactions for all variables indicating that treatments altered variables relative to controls. 
+
+### Post-harvest trajectory
+
+Next, I want to use repeated measures ANOVA to compare trajectories of each metric by comparing the 2010 (*post-harvest*) to the data from 2018. I will include the same effects as above. **Note**: Plots 3, 5, and 6 were struck by a tornado in 2017, and these plots were removed from consideration here.
+
+```{r dens-trajectory-anova, results='asis'}
+
+for(v in var) {
+  f = paste(v, '~ Treatment*year + (1|PLOT) + Block')
+  db = subset(dens_summary, year %in% c(2010, 2018))
+  db = subset(dens_summary, ! PLOT %in% c(3,5,6))
+  x = lmer(f, data=db)
+  x = Anova(x, type = 'III')
+  v = gsub('_', '-', v)
+  print(kable(x, format='pipe', caption = paste('ANOVA table indicating changes in', v, 'immediately post-harvest and 8 years post-harvest', v, 'following treatments.'), digits=c(2,0,3), label=paste0(v,'-traj')))
+}
+```
+
+These analyses show that Treatments changed over time compared to controls for all metrics except for $Dq$ which was relatively constant over time (Fig. \@ref(fig:dens-graphs)).
+
+```{r dens-graphs, fig.width=6.5, fig.height=4, fig.cap = 'Changes in forest structural components over the 8 year study period indicating changes in (a) density, (b) basal area, (c) *Pinus palustris* volume, and (d) quadratic mean diameter ($Dq$).'}
+ylab = c( expression('Basal area (m'^2* ' ha'^{-1}*')'),
+          expression(italic('P. palustris')*' volume'*'  (m'^3*' ha'^{-1}*')'),
+          expression('Density (ha'^-1*')'),
+          'Dq (cm)')
+
+cols = 1:4;
+
+par(mfrow = c(2,2), mar = c(1,4,0,0), oma = c(2.5,0,.5,0)+0.5)
+j=1
+for(v in var) {
+  box = which(v== var)
+  db = subset(dens_summary, !(PLOT %in% c(3,5,6) & year == 2018)) # leave out tornado damaged plots
+  x = ddply(db, .(Treatment, rel_year), summarize, mean = mean(get(v)),
+  se=sd(get(v))/sqrt(length(get(v))))
+  x$rel_year_j = as.numeric(as.character(x$rel_year)) + (c(1:4)/15)[x$Treatment]
+  ylim = range(with(x, c(mean+se, mean-se)))
+  fg = plot(mean ~ rel_year_j, data = x, ylim = ylim, col = cols[x$Treatment], pch=16, main = '', ylab = '', xlab = '', axes=FALSE)
+  abline(v=0, lty=1, lwd=2, col=grey(0.7))
+  abline(h=wade[v], lwd=6, col=rgb(0,0,1,0.3))
+  mtext(letters[j], 3, line=-1, cex=0.8, adj=0.05);j = j+1;
+  mtext(ylab[which(v==var)], 2, line=2.3, cex=0.8)
+  axis(1, labels = box %in% 3:4)
+  axis(2);box()
+  with(x, arrows(rel_year_j, mean+se, rel_year_j, mean-se, code = 3, angle=90, length = 0.01))
+  for(i in 1:4) {
+    x1 = subset(x, as.numeric(Treatment) == i)
+    lines(mean ~ rel_year_j, data = x1, col = cols[x1$Treatment], lwd=2)
+  }
+    if(box==1) legend(0, max(ylim), bty='n', c(levels(x$Treatment), 'Wade (1980)'), lwd=c(2,2,2,2,4), lty=1, col=c(cols,rgb(0,0,1,0.3)), cex=0.65)
+ 
+}
+  mtext('Years post-harvest', 1, line=1.5, outer = TRUE)
+```
+
+```{r dens-sum-by-trt}
+x = ddply(subset(dens_summary, year %in% 2009:2010), .(Treatment, year), summarize, ba_ha_mn = mean(ba_ha), ba_ha_sd = sd(ba_ha), pipa_vol_ha_mn = mean(pipa_vol_ha), pipa_vol_ha_sd = sd(pipa_vol_ha), dens_ha_mn = mean(dens_ha), dens_ha_sd = sd(dens_ha), dq_mn = mean(dq), dq_sd = sd(dq))
+for(i in 3:10) x[,i] = round(x[,i],2)
+for(i in c(3,5,7,9)) x[,i] = paste0(x[,i] , ' (', x[,i+1], ')')
+x[,c(4,6,8,10)] = NULL
+kable(x, caption = 'Summary of density metrics by silviculutural selection treatment', format='pipe')
+
+```
+
+
+## Diameter distribution
+
+Post harvest density and *Dq* seem to be some of the major changes among treatments. Next I'd like to generate diameter distributions for each plot type to compare how they changed following harvest.
+
+```{r diam-dist, fig.width=6.5, fig.cap = 'Changes in diameter distribution following harvest for each of four silvicultural treatments including (a) control, (b) group selection, (c) group selection with reserves, and (d) individual tree selection. Dark bars represent pre-treatment distribution and lighter bars represent post-treatment distribution. Note that ten trees $\\ge 80$ cm dbh were omitted for clarity.', results='hide'}
+  wade$diamdist = hist(wade_dat$dbh, breaks = seq(10, 140,by=4), plot = FALSE)
+
+  cols = c("#33A02C", "#B2DF8A")
+  par(mfrow = c(2,2), mar=c(0,0,0,0), oma=c(3.5,3.5,.5,.5))
+  labs = levels(as.factor(trt_tab$Treatment))
+  i = 1
+  for(t in labs)
+    {
+      if(t == 'Control') cols = c(grey(0.4), grey(0))
+      if(t == 'Group') cols = c('#DF5380', 	'#9B1C31')
+      if(t == 'Group+reserves') cols = c('#61D04F', 	'#399928')
+      if(t == 'Individual') cols = c('#2297E6', 	'#116399')
+      in_plots = subset(trt_tab, Treatment == t)$PLOT
+      plot_area = length(in_plots) * 4
+      tmp_trees = subset(trees@data, PLOT %in% in_plots)
+      pre_harv = subset(tmp_trees, year == 2009)
+      pos_harv = subset(tmp_trees, year == 2010)
+      pre_hist = hist(pre_harv$DBH, breaks = seq(10, 140,by=2), plot = FALSE)
+      pos_hist = hist(pos_harv$DBH, breaks = seq(10, 140,by=2), plot = FALSE)
+      
+      print(nrow(subset(pre_harv, DBH > 80)))
+     
+      plot(NA, xlim = c(10,80), ylim =c (0,15), axes= FALSE)
+      barplot(c(rep(0,5), pre_hist$counts/plot_area), width=2, add = TRUE, col = cols[2], space=0, axes=FALSE)
+      barplot(c(rep(0,5), pos_hist$counts/plot_area), width=2, add = TRUE, col = cols[1], space=0, axes=FALSE)
+      lines(wade$diamdist$mids, wade$diamdist$counts/wade$area, lwd=5, col=grey(1))
+      lines(wade$diamdist$mids, wade$diamdist$counts/wade$area, lwd=3, lty=1, col=rgb(0,0,1,0.3))
+      if(i %% 2) axis(2)
+      if(i>2) axis(1) else axis(1, labels=FALSE)
+      mtext(paste0(letters[i], '. ', labs[i]), side=3, line=-1.7, adj=.15, cex=0.8);box()
+      if(i !=1) legend('topright', c('Pre-harvest', 'Post-harvest'), col = rev(cols), lty=c(1,1), lwd=4, bty='n', cex=0.8)
+      if(i == 1) legend('topright', c('Control', 'Wade (1980)'), col=c(grey(0.4), rgb(0,0,1,0.3)), lty=1, lwd=c(4,3), bty='n', cex=0.8)
+      i=i+1
+      if(i==4)  mtext('dbh (cm)', side = 1, line = 2.5, outer=TRUE)
+      if(i==4)  mtext(expression("Density (ha"^-1*")"), side = 2, line = 2, outer=TRUE)
+      text(80, 1, '*', cex=1.5)
+  }
+
+```
+
+Changes in diameter distribution occurred relatively evenly across diameter classes for the group selection and group selection with reserves treatments (but removals of trees with dbh > 60 cm were rare). For these treatments removals in the 10-30 cm ranged were from 8-15%. However, in the Stoddard-Neel selection treatments, removals were high in the 10-30 cm range was 51%, much higher than other treatment types.  Figures shows diameters up to 80 m, but though trees > 80 cm were present
+
+```{r small-tree-removal, cache=TRUE}
+#Removals in the 10-30 cm range
+pre_harv = subset(trees09, DBH <= 30)
+pos_harv = subset(trees10, DBH <= 30)
+pre_harv = merge(pre_harv, trt_tab)
+pos_harv = merge(pos_harv, trt_tab)
+x1 = ddply(pre_harv@data, .(Treatment), summarize, pre_n = length(SPECIES))
+x2 = ddply(pos_harv@data, .(Treatment), summarize, pos_n = length(SPECIES))
+x = merge(x1,x2)
+x$rm = with(x, 1 - (pos_n/pre_n))
+kable(x, caption='Total number of trees $\\le$ 30 cm dbh before and after silvicultural treatments and proportion of trees removed.', digits=c(0,0,0,3), format='pipe')
+
+```
+
+# Non-spatial mortality and recruitment rates
+
+* Calculate mortality relative to post-treatment (2010) tree density to generate `dynamics_rel` dataframe Table with absolute recruitment and mortality rates is also retained in the `dyanmics_abs` dataframe.
+
+* **Note** that in all analyses of mortality and recruitment, I ommitted plots 3, 5, and 6 which experienced tornado damage in 2017.
+
+```{r recruit-mort-rates}
+rec_tree_list = subset(wide_table, !is.na(wide_table$r_yr))
+mor_tree_list = subset(wide_table, !is.na(wide_table$m_yr))
+
+x = rbind(rec_tree_list, mor_tree_list)
+x = ddply(x, .(PLOT), summarize, r_abs = sum(!is.na(r_yr)), m_abs = sum(!is.na(m_yr)), net=r_abs-m_abs)
+x[,2:4] = x[,2:4] / (4*8) # calculate change ha-1 yr-1
+
+# add in the 2010 tree density to get proportions
+y = subset(dens_summary, year == 2010)
+y = y[, c('PLOT', 'dens_ha')]
+x = merge(x,y)
+
+x$p_rec = with(x, r_abs/dens_ha)*100
+x$p_mor = with(x, m_abs/dens_ha)*100
+x$p_net = with(x, net/dens_ha)*100
+
+x = merge(x, trt_tab)
+
+dynamics_abs = x[, c(1:4,9:10)]
+dynamics_rel = x[, c(1,6:10)]
+
+```
+
+```{r rec-mort-summary}
+x1 = ddply(subset(dynamics_abs, ! PLOT %in% c(3,5,6)), .(Treatment), summarize, rec = mean(r_abs), mort = mean(m_abs), net=mean(net))
+x2 = ddply(subset(dynamics_abs, ! PLOT %in% c(3,5,6)), .(Treatment), summarize, rec = sd(r_abs), mort = sd(m_abs), net=sd(net))
+x1$rec = paste0(round(x1$rec, 2), ' (', round(x2$rec,2), ')')
+x1$mort = paste0(round(x1$mort, 2), ' (', round(x2$mort,2), ')')
+x1$net = paste0(round(x1$net, 2), ' (', round(x2$net,2), ')')
+kable(x1,  col.names = c('Treatment', 'Recruitment rate', 'Mortality rate', 'Net change'), caption = 'Recuritment and mortality rates by treatment and net change. All units are expressed in stems ha$^{-1}$ yr$^{-1}$.', format='pipe', align='l', label='rec-mort-abs', booktabs=TRUE)
+
+x1 = ddply(subset(dynamics_rel, ! PLOT %in% c(3,5,6)), .(Treatment), summarize, rec = mean(p_rec), mort = mean(p_mor), net=mean(p_net))
+x2 = ddply(subset(dynamics_rel, ! PLOT %in% c(3,5,6)), .(Treatment), summarize, rec = sd(p_rec), mort = sd(p_mor), net=sd(p_net))
+x1$rec = paste0(round(x1$rec, 2), ' (', round(x2$rec,2), ')')
+x1$mort = paste0(round(x1$mort, 2), ' (', round(x2$mort,2), ')')
+x1$net = paste0(round(x1$net, 2), ' (', round(x2$net,2), ')')
+kable(x1,  col.names = c('Treatment', 'Recruitment rate (%)', 'Mortality rate (%)', 'Net change (%)'), caption = 'Recuritment and mortality rates by treatment and net change as. All units are expressed as a percentage change from post-harvest (2010) stem density ', label='rec-mort-per', format='pipe', align='l', booktabs=TRUE)
+
+```
+
+```{r rec-mort-abs-plot, fig.height=3, fig.cap='Recruitment, mortality rate, and net change in tree density by treatment. Error bars represent 1 s.e. of the mean.'}
+x1 = ddply(subset(dynamics_abs, ! PLOT %in% c(3,5,6)), .(Treatment), summarize, r = mean(r_abs), m = mean(-m_abs), n = mean(net))
+x2 = ddply(subset(dynamics_abs, ! PLOT %in% c(3,5,6)), .(Treatment), summarize, r = sd(r_abs), m = sd(m_abs), n = sd(net))
+x3 = ddply(subset(dynamics_abs, ! PLOT %in% c(3,5,6)), .(Treatment), summarize, r = length(r_abs), m = length(-m_abs), n = length(net))
+x4 = x2[,2:4]/sqrt(x3[,2:4])
+x2[,2:4] = x4
+
+x1 = melt(x1, id = 'Treatment')
+x2 = melt(x2, id = 'Treatment')
+ylim = range(c(x1$value + x2$value, x1$value - x2$value))
+ylim = c(floor(ylim[1]), ceiling(ylim[2]))
+par(mar = c(2,4.5,1,1))
+fg = barplot(value ~ Treatment + variable, data = x1, beside=TRUE, ylab = expression(stems~ha^-1~yr^-1), ylim = ylim, names.arg = c('recruitment', 'mortality', 'net gain'), col=1:4, xlab='')
+legend('bottomleft', levels(x1$Treatment), fill = 1:4, bty='n', cex=0.7)
+arrows(fg, (x1$value+x2$value), fg, (x1$value-x2$value), angle=90, code=3, length=0.02, col=grey(.3))
+box()
+abline(h=0)
+
+```
+
+```{r rec-mort-rel-plot, fig.height=3, fig.cap='Recruitment, mortality rate, and net change in tree density by treatment as a percentage of post-harvest (2010) density. Error bars represent 1 s.e. of the mean.'}
+x1 = ddply(subset(dynamics_rel, ! PLOT %in% c(3,5,6)), .(Treatment), summarize, r = mean(p_rec), m = mean(-p_mor), n = mean(p_net))
+x2 = ddply(subset(dynamics_rel, ! PLOT %in% c(3,5,6)), .(Treatment), summarize, r = sd(p_rec), m = sd(p_mor), n = sd(p_net))
+x3 = ddply(subset(dynamics_rel, ! PLOT %in% c(3,5,6)), .(Treatment), summarize, r = length(p_rec), m = length(-p_mor), n = length(p_net))
+x4 = x2[,2:4]/sqrt(x3[,2:4])
+x2[,2:4] = x4
+
+x1 = melt(x1, id = 'Treatment')
+x2 = melt(x2, id = 'Treatment')
+ylim = range(c(x1$value + x2$value, x1$value - x2$value))
+ylim = c(floor(ylim[1]), ceiling(ylim[2]))
+par(mar = c(2,4.5,1,1))
+fg = barplot(value ~ Treatment + variable, data = x1, beside=TRUE, ylab = '% change in stems', ylim = ylim, names.arg = c('recruitment', 'mortality', 'net gain'), col=1:4, xlab='')
+legend('bottomleft', levels(x1$Treatment), fill = 1:4, bty='n', cex=0.7)
+arrows(fg, (x1$value+x2$value), fg, (x1$value-x2$value), angle=90, code=3, length=0.02, col=grey(.3))
+box()
+abline(h=0)
+
+```
+
+* Analyze recruitment and mortality rates (absolute rates) using ANOVA. There were only a marginally significant ($p = 0.065$) change in recruitment rates, with the Groups + reserves treatment showing the highest rates of recruitment.
+
+```{r rec-mort-analysis-abs, results='asis'}
+var = c('r_abs', 'm_abs', 'net')
+
+for(v in var) {
+  f = paste(v, '~ Treatment + Block')
+  x = lm(f, data=subset(dynamics_abs))
+  x = anova(x)
+  v = gsub('_', '-', v)
+  print(kable(x, label=v, caption = paste('ANOVA table showing changes in ', v, 'by treatment'), digits = c(0,2,2,2,3), format='pipe', booktabs=TRUE))
+}
+```
+
+* Analyze recruitment and mortality rates (as a percentage) using ANOVA. There were only a marginally significant ($p = 0.065$) change in recruitment rates, with the Groups + reserves treatment showing the highest rates of recruitment.
+
+```{r rec-mort-analysis-rel, results='asis'}
+var = c('p_rec', 'p_mor', 'p_net')
+
+for(v in var) {
+  f = paste(v, '~ Treatment + Block')
+  x = lm(f, data=subset(dynamics_rel))
+  x = anova(x)
+  v = gsub('_', '-', v)
+  print(kable(x, label=v, caption = paste('ANOVA table showing changes in ', v, 'by treatment'), digits = c(0,2,2,2,3), format='pipe', booktabs=TRUE))
+}
+
+```
+
+* How does mortality vary as a function of size? Does relationship between mortality and size vary by treatment?
+
+```{r mort-size, results='hide'}
+x = subset(wide_table, SPECIES == 'PIPA' & ! is.na(DBH_2009) & !PLOT %in% c(3,5,6))
+x$m = as.factor(as.numeric(!is.na(x$m_yr)))
+x$dbh_z = with(x, (DBH_2009 - mean(DBH_2009, na.rm=TRUE))/sd(DBH_2009, na.rm=TRUE))
+x$dbh_cls = cut(x$DBH_2009, seq(10,80,5), include.lowest=TRUE)
+x = merge(x, trt_tab)
+
+y = subset(x, m == 1)
+z = ddply(y, .(PLOT, Treatment), summarize, mean_d = mean(DBH_2009), Dq = sqrt(mean(DBH_2009^2)))
+z = ddply(z, .(Treatment), summarize, mean_diam = mean(mean_d), sd_diam = sd(mean_d), mean_Dq = mean(Dq), sd_Dq = sd(Dq))
+
+kable(z, format='pipe', label='mort-size-dq', digits=1, caption = 'Arithmetic and quadratic mean diameter of dead trees by treatment.', booktabs=TRUE)
+
+```
+
+There are very few individuals $> 70$ cm dbh (*i.e.*, four individuals), so I will include only indivudals $\le 70 cm$ in the following analyses and figures.
+
+```{r mort-size-trt-model, results='asis'}
+# Model mortality as a function of DBH (quadratic), include complimenatry log-log link
+x = subset(x, DBH_2009 <= 70)
+mort_mod = glmer(m ~ (dbh_z + I(dbh_z^2)) * Treatment +  (1|PLOT), data = x, family = binomial(link="cloglog"))
+#summary(mort_mod)
+mort_mod_aov = Anova(mort_mod, type='II')
+kable(mort_mod_aov, format='pipe', label='mort-mod', digits=c(2,2,3), caption='Results of mixed-effects generalized linear model indicating effect of treatment and tree size on mortality rates.', booktabs=TRUE)
+
+kable(MuMIn::r.squaredGLMM(mort_mod), digits = 3, format = 'pipe', label='mort-mod-r2', caption = 'Marginal (R$^2_m$) and conditional (R$^2_c$) fits of mixed-effects generalized model.')
+
+# Identify plot with 'average' random effect, intercept ~ 0
+rand = random.effects(mort_mod)$PLOT$`(Intercept)`
+rand = which((abs(rand) == min(abs(rand))))
+avg_plot = levels(x$PLOT)[rand] # pick plot with 'average' rand. eff
+
+```
+
+```{r mort-size-plot, fig.width=4, fig.height=3, fig.cap='Relationship between mortality and tree diameter among treatments.'}
+# Plot fitted mortality values by treatment
+newdf = expand.grid(dbh = seq(10,60,.5), Treatment = levels(x$Treatment), PLOT = avg_plot)
+newdf$dbh_z = with(x, (newdf$dbh - mean(DBH_2009, na.rm=TRUE))/sd(DBH_2009, na.rm=TRUE))
+newdf$pred = predict(mort_mod, newdf, type='response')
+par(mar=c(2,.5,.5,0), oma=c(2,3,0,0))
+plot(NA, xlim = c(10,60), ylim = c(0,.2))
+i = 1
+for(t in levels(newdf$Treatment)){
+y = subset(newdf, Treatment == t)
+lines(pred ~ dbh, data = y, col = i, lwd=2)
+i = i+1
+}
+legend('topright', levels(newdf$Treatment), col=1:4, bty='n', lwd=2, cex=0.7)
+mtext('DBH (cm)', side=1, line=1, outer=TRUE) 
+mtext('p(mortality)', side=2, line=2, outer=TRUE) 
+
+```
+
+\newpage
+
+# Changes in spatial structure
+
+In order to determine how silvicultural treatments varied in spatial pattern and how these patterns compared to examples of old-growth forests. I used the `spatstat` package. The goal of these analyses were to use pair correlation functions `spatstat::pcf()` to assess spatial pattern at various scales. 
+
+Using 999 simulations, I used the `pcf` function to assess the spatial pattern of trees. To more completely assess the change, I calculated `pcf`s separately for all trees, small trees (dbh < 30), medium trees (30 $\le$ dbh < 50), and large trees (dbh $\ge$ 50).
+
+In the controls, I found high spatial clustering at small scales (Figure \@ref(fig:plot-overall-pcf)a). Clustering was higher for small trees, and diminished with larger trees (Figure \@ref(fig:plot-overall-pcf)e,i,m). Treatments generally slightly increased spatial clustering overall (Figure \@ref(fig:plot-overall-pcf)b,c), and for individual tree size classes (e.g., Figure \@ref(fig:plot-overall-pcf)f,j,h). However, a notable exception is the Individual tree selection treamtn whichwhere clustering decreased overall, especially at small scales (Figure \@ref(fig:plot-overall-pcf)d). This was primarily due to reduction in clustering of the 30-50 cm size class (Figure \@ref(fig:plot-overall-pcf)l).
+
+```{r}
+wade$pcf_all = pcf(wade$ppp)
+wade$pcf_sm = pcf(subset(wade$ppp, wade$marks<30))
+wade$pcf_md = pcf(subset(wade$ppp, wade$marks>=30 & wade$marks<50))
+wade$pcf_lg = pcf(subset(wade$ppp, wade$marks>=50))
+```
+
+```{r overall-spatial-pcf, results = 'hide'}
+load('savepoint1.RData')
+if(0) {
+sims = 999
+# Convert all_trees to ppp object and run pcf
+pcf_objs = list()
+# Get pcfs for 2010 (1 yr post-treatment) trees
+for(t in levels(as.factor(plots_bnd$Treatment))){
+  in_plots = subset(plots_bnd, Treatment == t)
+  pos_harv = subset(trees10, PLOT %in% in_plots$PlotID)
+  coords = coordinates(pos_harv)
+  trees.ppp = as.ppp(coords, W = as(in_plots, 'owin'))
+  trees.ppp$DBH = pos_harv$DBH
+  trees.ppp$SPECIES = tmp_trees$SPECIES
+  cat('converted', t, 'trees to .ppp\nPCF envelope for all trees\n')
+  pcf_all = envelope(trees.ppp, pcf, nsim=sims)
+  cat('pcf envelope for small trees\n')
+  pcf_sm =  envelope(subset(trees.ppp, trees.ppp$DBH<30), pcf, nsim=sims)
+  cat('pcf envelope for medium trees\n')
+  pcf_md =  envelope(subset(trees.ppp, trees.ppp$DBH>=30 & trees.ppp$DBH<50), pcf, nsim=sims)
+  cat('pcf envelope for large trees\n')
+  pcf_lg =  envelope(subset(trees.ppp, trees.ppp$DBH>=50), pcf, nsim=sims)
+  
+  tmp_list = list(pcf_all = pcf_all, pcf_sm = pcf_sm, pcf_md = pcf_md, pcf_lg = pcf_lg)
+  pcf_objs[[t]] = tmp_list
+}
+
+# Get pre-treatment lines
+for(t in levels(as.factor(plots_bnd$Treatment))){
+  in_plots = subset(plots_bnd, Treatment == t)
+  pre_harv = subset(trees09, PLOT %in% in_plots$PlotID)
+  coords = coordinates(pre_harv)
+  trees.ppp = as.ppp(coords, W = as(in_plots, 'owin'))
+  trees.ppp$DBH = pre_harv$DBH
+  trees.ppp$SPECIES = tmp_trees$SPECIES
+  cat('converted ', t, 'trees to .ppp\nPCF for all trees\n')
+  pcf_all = pcf(trees.ppp)
+  cat('pcf for small trees\n')
+  pcf_sm =  pcf(subset(trees.ppp, trees.ppp$DBH<30))
+  cat('pcf for medium trees\n')
+  pcf_md =  pcf(subset(trees.ppp, trees.ppp$DBH>=30 & trees.ppp$DBH<50))
+  cat('pcf  for large trees\n')
+  pcf_lg =  pcf(subset(trees.ppp, trees.ppp$DBH>=50))
+  
+  tmp_list = list(pcf_all = pcf_all, pcf_sm = pcf_sm, pcf_md = pcf_md, pcf_lg = pcf_lg)
+  pcf_objs[[paste0('pre_',t)]] = tmp_list
+}
+save.image('savepoint1.RData')
+  
+}
+
+```
+
+```{r plot-overall-pcf, cache = FALSE, include = TRUE, fig.width=6.5, fig.height=6.5, fig.cap="Pair correlation functions illustrating changes in spatial pattern of overstory trees before (2009, solid line) and after (2010, dashed line) four silvicultural selection treatments. Shading represents expectation under complete spatial randomness generated from 999 simulations of the 2010 data. Portions of each function above or below shading represents significant aggregation or over-dispersion, respectively, and portions of the function within the grey shading represent random dispersion of tree locations."}
+# Plot all pcf functions
+load('savepoint1.RData')
+par(mfrow = c(4,4), mar = c(0,0,0,0), oma = c(5,5,2,1), cex=.5)
+pars = list(legend = FALSE, ylim = c(.5,4), axes=FALSE, xlim = c(0,50), lwd=2, cex=0.7)
+i = 1
+x = c(1,5,9,13)
+l = letters[c(x,x+1,x+2,x+3)]
+for(t in levels(trt_tab$Treatment)){
+  tmp_pcfs = pcf_objs[[t]]
+  tmp_pre_pcfs = pcf_objs[[paste0('pre_', t)]]
+  do.call(plot, c(x=list(tmp_pcfs$pcf_all), main = '', pars));box();axis(2)
+  lines(iso ~ r, data = tmp_pre_pcfs$pcf_all, lty=2, lwd=1)
+  mtext(l[i], side=3, adj=0.07, cex=0.7, line=-2);i=i+1
+  lines(iso ~ r, data = wade$pcf_all, lwd=2, col=rgb(0,0,1,0.3))
+  if(t %in% c('Control', 'Group+reserves')) axis(2)
+  if(t == 'Individual') axis(1)
+  if(t == 'Control') {
+    mtext('all trees', side=3, cex=0.7)
+    legend('topright', legend=c('pre-harvest (2009)','post-harvest (2010)', 'Wade Tract (1980)'), lwd=c(1,2,2), lty=c(2,1,1), col = c(1,1,rgb(0,0,1,.3)), bty='n')}
+  mtext(text=t, side= 2, line = 2.5, font=2, cex=0.7)
+  do.call(plot, c(x=list(tmp_pcfs$pcf_sm), main = '', pars));box(); if(t == 'Individual') axis(1)
+    mtext(l[i], side=3, adj=0.07, cex=0.7, line=-2);i=i+1
+  lines(iso ~ r, data = wade$pcf_sm, lwd=2, col=rgb(0,0,1,0.3))
+  lines(iso ~ r, data = tmp_pre_pcfs$pcf_sm, lty=2)
+  if(t == 'Control') mtext('dbh < 30 cm', side=3, cex=0.7)
+  do.call(plot, c(x=list(tmp_pcfs$pcf_md), main = '', pars));box(); if(t == 'Individual') axis(1)
+  mtext((l[i]), side=3, adj=0.07, cex=0.7, line=-2);i=i+1
+  lines(iso ~ r, data = wade$pcf_md, lwd=2, col=rgb(0,0,1,0.3))
+  lines(iso ~ r, data = tmp_pre_pcfs$pcf_md, lty=2)
+  if(t == 'Control') mtext(expression(30 <= 'dbh' * ' < 50 cm'), side=3, cex=0.7)
+  do.call(plot, c(x=list(tmp_pcfs$pcf_lg), main = '', pars));box(); if(t == 'Individual') axis(1)
+  mtext((l[i]), side=3, adj=0.07, cex=0.7, line=-2);i=i+1
+  lines(iso ~ r, data = wade$pcf_lg, lwd=2, col=rgb(0,0,1,0.3))
+  lines(iso ~ r, data = tmp_pre_pcfs$pcf_lg, lty=2)
+  if(t == 'Control') mtext(expression("dbh ">=50), side=3, cex=0.7);
+  axis(side=4)
+}
+mtext('distance (m)', side = 1, outer = TRUE, line = 3)
+mtext(expression(g(r)), side = 2, outer = TRUE, line = 3)
+```
+
+\newpage
+
+# Spatial patterns of mortality and recruitment
+
+
+```{r setup-rec-mort-sp}
+trees10 = subset(trees, year == 2010)
+trees14 = subset(trees, year == 2014)
+trees18 = subset(trees, year == 2018)
+trees10$treeID = with(trees10@data, paste0(sprintf('%02d',PLOT), '_', sprintf('%03d', TAGNO)))
+trees14$treeID = with(trees14@data, paste0(sprintf('%02d',PLOT), '_', sprintf('%03d', TAGNO)))
+trees18$treeID = with(trees18@data, paste0(sprintf('%02d',PLOT), '_', sprintf('%03d', TAGNO)))
+
+# Identify all the recruited trees
+rec_tree_list = subset(wide_table, !is.na(wide_table$r_yr))
+rec_tree_list$treeID = with(rec_tree_list, paste0(sprintf('%02d', PLOT), '_', sprintf('%03d', TAGNO)))
+x1 = subset(trees18, treeID %in% subset(rec_tree_list, r_yr==2018)$treeID)
+x2 = subset(trees14, treeID %in% subset(rec_tree_list, r_yr==2014)$treeID)
+rec_trees = rbind(x1, x2)
+ 
+# Identify all the mortality trees
+mor_tree_list = subset(wide_table, !is.na(wide_table$m_yr))
+mor_tree_list$treeID = with(mor_tree_list, paste0(sprintf('%02d', PLOT), '_', sprintf('%03d', TAGNO)))
+x1 = subset(trees14, treeID %in% subset(mor_tree_list, m_yr==2018)$treeID)
+x2 = subset(trees10, treeID %in% subset(mor_tree_list, m_yr==2014)$treeID)
+mor_trees = rbind(x1, x2)
+
+```
+
+```{r rec-mort-pcf, results='hide', eval=FALSE}
+sims = 999
+recruit_pcf = list()
+mortality_pcf = list()
+ 
+for(t in levels(as.factor(plots_bnd$Treatment))){
+  in_plots = subset(plots_bnd, Treatment == t & ! PlotID %in% c(3,5,6))
+  tmp_trees = subset(rec_trees, PLOT %in% in_plots$PlotID)
+  coords = coordinates(tmp_trees)
+  trees.ppp = as.ppp(coords, W = as(in_plots, 'owin'))
+  cat('converted ', t, 'trees to .ppp\nPCF envelope for all trees\n')
+  pcf_all = envelope(trees.ppp, pcf, nsim=sims)
+  recruit_pcf[[t]] = pcf_all
+}
+
+for(t in levels(as.factor(plots_bnd$Treatment))){
+  in_plots = subset(plots_bnd, Treatment == t & ! PlotID %in% c(3,5,6))
+  tmp_trees = subset(mor_trees, PLOT %in% in_plots$PlotID)
+  coords = coordinates(tmp_trees)
+  trees.ppp = as.ppp(coords, W = as(in_plots, 'owin'))
+  cat('converted ', t, 'trees to .ppp\nPCF envelope for all trees\n')
+  pcf_all = envelope(trees.ppp, pcf, nsim=sims)
+  mortality_pcf[[t]] = pcf_all
+}
+
+```
+
+How does the spatial pattern of new recruits change across treatments?
+
+```{r rec-local, eval=FALSE}
+# Explore the pattern of recruits using local spatial statistics
+
+recruits=rec_trees
+join_zone = disaggregate(gBuffer(recruits, width = 3))
+join_zone$patchid = 1:length(join_zone)
+recruits = intersect(recruits, join_zone)[, c('PLOT', 'SPECIES', 'd')]
+#summary(as.factor(recruits$SPECIES))/ nrow(recruits) #Recruits were overwhelmingly PIPA (92%)
+recruits = merge(recruits, plots_bnd@data[, c('PlotID', 'Treatment')], by.x = 'PLOT', by.y = "PlotID")
+recruits = merge(recruits, trt_tab)
+grp_size = ddply(recruits@data, .(d,Treatment,PLOT), summarize, n = length(PLOT))
+grp_size$cls = cut(grp_size$n, breaks = c(0,1.1,4.1,10.1,2000), labels = c('1', '2-4', '5-10', '10+'))
+tmp = ddply(grp_size, .(cls, PLOT), summarize, n_ha = sum(n)/4, .drop = FALSE)
+tmp=merge(tmp, plots_bnd[, c('PlotID', 'Treatment', 'Block')], by.x='PLOT', by.y='PlotID')
+tots = ddply(tmp, .(PLOT), summarize, n = sum(n_ha))
+tmp = merge(tmp, tots)
+tmp$p = with(tmp, n_ha/n)
+recruit_grp_size = tmp
+
+x = ddply(recruit_grp_size, .(Treatment, cls), summarize, p = mean(p))
+x$p = x$p*100
+x = suppressMessages(recast(x, Treatment ~ cls))
+kable(x, digits = 1, caption = 'Percentage of recruiting trees by tree group size and treatment.', format='pipe')
+```
+
+
+How does the spatial pattern of mortality events change across treatments?
+
+```{r mort-local, eval=FALSE}
+mortals = mor_trees
+join_zone = disaggregate(gBuffer(mortals, width = 3))
+join_zone$patchid = 1:length(join_zone)
+mortals = intersect(mortals, join_zone)[, c('PLOT', 'SPECIES', 'd')]
+#summary(as.factor(mortals$SPECIES))/ nrow(mortals) #mortals were generally PIPA (85%)
+mortals = merge(mortals, plots_bnd@data[, c('PlotID', 'Treatment')], by.x = 'PLOT', by.y = "PlotID")
+mortals = merge(mortals, trt_tab)
+grp_size = ddply(mortals@data, .(d,Treatment,PLOT), summarize, n = length(PLOT))
+grp_size$cls = cut(grp_size$n, breaks = c(0,1.1,4.1,10.1,2000), labels = c('1', '2-4', '5-10', '10+'))
+tmp = ddply(grp_size, .(cls, PLOT), summarize, n_ha = sum(n)/4, .drop = FALSE)
+tmp=merge(tmp, plots_bnd[, c('PlotID', 'Treatment', 'Block')], by.x='PLOT', by.y='PlotID')
+tots = ddply(tmp, .(PLOT), summarize, n = sum(n_ha))
+tmp = merge(tmp, tots)
+tmp$p = with(tmp, n_ha/n)
+mortal_grp_size = tmp
+
+x = ddply(mortal_grp_size, .(Treatment, cls), summarize, p = mean(p))
+x$p = x$p*100
+x = suppressMessages(recast(x, Treatment ~ cls))
+kable(x, digits = 1, caption = 'Percentage of dead trees by tree group size and treatment.', format='pipe')
+
+save.image('analysis_savepoint2.RData')
+
+
+```
+
+
+```{r rec-mort-bivpcf, results='hide', eval=FALSE}
+# Need to quantify spatial associations of recruits to established trees
+list_of_recs = rec_trees$treeID
+rec_ppp = trees18
+length(list_of_recs)
+rec_ppp$mark = NA
+rec_ppp$mark = ifelse(rec_ppp$treeID %in% list_of_recs, 'RECRUIT', 'MATURE')
+rec_ppp$mark = as.factor(rec_ppp$mark)
+
+sims= 999
+recruit_pcf_marks = list()
+for(t in levels(as.factor(plots_bnd$Treatment))){
+  in_plots = subset(plots_bnd, Treatment == t)
+  tmp_trees = subset(rec_ppp, PLOT %in% in_plots$PlotID)
+  proj4string(tmp_trees) = proj4string(plots_bnd)
+  tmp_trees = tmp_trees[plots_bnd,]
+  coords = coordinates(tmp_trees)
+  trees.ppp = as.ppp(coords, W = as(in_plots, 'owin'))
+  trees.ppp$marks = tmp_trees$mark
+  biv_pcf = envelope(trees.ppp, 'pcfcross', nsim=sims, i='RECRUIT', j = 'MATURE')
+  cat('completed', sims, 'sims for treatment', t,'\n')
+  recruit_pcf_marks[[t]] = biv_pcf
+}
+
+# Need to quantify spatial associations of recruits to established trees
+list_of_mort = mor_trees$treeID
+mor_ppp = trees10
+length(list_of_mort)
+mor_ppp$mark = NA
+mor_ppp$mark = ifelse(mor_ppp$treeID %in% list_of_mort, 'MORTALITY', 'MATURE')
+mor_ppp$mark = as.factor(mor_ppp$mark)
+summary(mor_ppp$mark)
+
+mortality_pcf_marks = list()
+for(t in levels(as.factor(plots_bnd$Treatment))){
+  in_plots = subset(plots_bnd, Treatment == t)
+  tmp_trees = subset(mor_ppp, PLOT %in% in_plots$PlotID)
+  proj4string(tmp_trees) = proj4string(plots_bnd)
+  tmp_trees = tmp_trees[plots_bnd,]
+  coords = coordinates(tmp_trees)
+  trees.ppp = as.ppp(coords, W = as(in_plots, 'owin'))
+  trees.ppp$marks = tmp_trees$mark
+  biv_pcf = envelope(trees.ppp, 'pcfcross', nsim=sims, i='MORTALITY', j = 'MATURE')
+  cat('completed', sims, 'sims for treatment', t,'\n')
+  mortality_pcf_marks[[t]] = biv_pcf
+}
+
+save.image('analysis_savepoint3.Rdata')
+```
+
+```{r rec-pcf-plot, fig.height=5, fig.width=6.5, fig.cap="(a-d) Pair correlation functions illustrating spatial pattern of individual trees that recruited between 2009 and 2019 tree surveys illustrating strong clumping of regeneration across scales for all treatments. Shading represents expectation under complete spatial randomness generated from 999 simulations. Interpretation as in Figure 4. Inset barplots indicate the distribution of newly recruited trees based on group size with trees within 6 m considered a contiguous group. (e-h) Marked pair correlations functions showing the spatial associations between newly recruited (rec) and already established (est) individuals. "}
+load('analysis_savepoint3.Rdata')
+
+# Plot pcf functions of recruited trees with barplot insets of group size.
+  
+  inset_coords = list(c(.12,.23,.55,.88), c(.37,.48,.55,.88), c(.62,.73,.55,.88), c(.87,.98,.55,.88))
+  inset_coords = lapply(inset_coords, function(x) return(c(x[1]+0.01, x[2], .72, .93)))
+  o_main_coords = list(c(0,0.25,0,1), c(0.25,.5,0,1), c(.5,0.75,0,1), c(0.75,1,0,01),c())
+  main_coords = lapply(o_main_coords, function(x) return(c(x[1], x[2], .52, x[4])))
+  i=1
+  par(mfrow = c(2,4), mar = c(0,0,0,0), oma = c(5,5,0.5,0.5))
+  for(t in levels(as.factor(plots_bnd$Treatment))){
+    par(fig = main_coords[[i]],new=TRUE)
+    plot(recruit_pcf[[t]], xlim = c(0,50), ylim =c(0,25), legend=FALSE, axes=FALSE, main = '', lwd=2)
+    #plot(recruit_pcf[[t]], xlim = c(0,50), ylim =c(0,25), main = '', lwd=2)
+    box()
+    mtext(paste(letters[i],'. ', t), line=-1.4, adj=0.07, cex=0.8)
+    if(t == 'Control') axis(2)
+    axis(1, at = (0:4)*10)
+    
+    #insert barplot of group sizes
+    par(fig = inset_coords[[i]],new=TRUE, xpd=TRUE);i=i+1
+    tmp = subset(recruit_grp_size, Treatment == t)
+    mns = with(tmp, by(p, cls, mean))
+    ses = with(tmp, by(p, cls, sd))/sqrt(with(tmp, by(p, cls, length)))
+    fg = barplot(mns, xlab = 'group size', ylab = 'proportion', ylim = c(0,.7), cex.names=0.75, space=0, las=2)
+    mtext('group size', side=1, line=2.5, cex = 0.75)
+    mtext('proportion', side=2, line=2.5, cex = 0.75)
+    arrows(fg, mns+ses, fg, mns-ses, code=3, angle=90, length = 0.025)
+
+  }
+  mtext(c('g(r)', 'distance (m)'), side = 2:1, adj=c(0.75,.5), outer= TRUE, line=3)
+  
+  main_coords = lapply(o_main_coords, function(x) return(c(x[1], x[2], x[3],.48)))
+  i=1
+for(t in levels(as.factor(plots_bnd$Treatment))){
+  par(fig = main_coords[[i]],new=TRUE, mar = c(0,0,2,0))
+  tmp_pcf = recruit_pcf_marks[[t]]
+  plot(tmp_pcf, xlim = c(0,100), legend = FALSE, lwd=1, axes=FALSE, main = '', ylim = c(0.5,2))
+  box()
+  axis(1, at =(0:4)*20 )
+  if(t == 'Control') {axis(2)
+    mtext(expression(italic(g)[italic('rec,est')]*' '*(italic(r))), side=2, line=3)}
+  mtext(paste0(letters[i+4], '. ', t), 3, adj=0.1, line=-1.2, cex=0.8)
+  i=i+1
+}
+  load('analysis_savepoint3.Rdata')
+
+  
+```
+
+```{r mort-pcf-plot, fig.height=5, fig.width=6.5, fig.cap="(a-d) Pair correlation functions illustrating spatial pattern of trees that died between 2009 and 2019 tree surveys illustrating strong clumping of mortality across scales for all treatments. Shading represents expectation under complete spatial randomness generat ed from 999 simulations. Interpretation of clustering as in Figure 3. Inset barplots indicate the group size of dead trees considering dead trees within 6 m as a contiguous group. (e-h) Marked pair correlations functions showing the spatial associations between dead trees (mor) and already established (est) individuals."}
+
+
+  inset_coords = list(c(.12,.23,.55,.88), c(.37,.48,.55,.88), c(.62,.73,.55,.88), c(.87,.98,.55,.88))
+  inset_coords = lapply(inset_coords, function(x) return(c(x[1]+0.01, x[2], .72, .93)))
+  o_main_coords = list(c(0,0.25,0,1), c(0.25,.5,0,1), c(.5,0.75,0,1), c(0.75,1,0,01),c())
+  main_coords = lapply(o_main_coords, function(x) return(c(x[1], x[2], .52, x[4])))
+  i=1
+  par(mfrow = c(1,4), mar = c(0,0,0,0), oma = c(5,5,0.5,0.5))
+  for(t in levels(as.factor(plots_bnd$Treatment))){
+    par(fig = main_coords[[i]],new=TRUE, mar=c(0,0,1,0))
+    plot(mortality_pcf[[t]], xlim = c(0,50), ylim =c(0,25), legend=FALSE, axes=FALSE, main = '', lwd=2)
+    box()
+    mtext(paste(letters[i],'. ', t), line=-1.4, adj=0.05, cex=0.8)
+    if(t == 'Control') axis(2)
+    axis(1, at = (0:4)*10)
+    # insert barplot of group sizes
+    par(fig = inset_coords[[i]],new=TRUE, xpd=TRUE);i=i+1
+    tmp = subset(mortal_grp_size, Treatment == t)
+    mns = with(tmp, by(p, cls, mean))
+    ses = with(tmp, by(p, cls, sd))/sqrt(with(tmp, by(p, cls, length)))
+    fg = barplot(mns, xlab = 'group size', ylab = 'proportion', ylim = c(0,.9), cex.names=0.75, space=0)
+    mtext('group size', side=1, line=2, cex = 0.75)
+    mtext('proportion', side=2, line=2, cex = 0.75)
+    arrows(fg, mns+ses, fg, mns-ses, code=3, angle=90, length = 0.025)
+  }
+  mtext(c('g(r)', 'distance (m)'), side = 2:1, adj=c(0.75,.5), outer= TRUE, line=3)
+  
+   main_coords = lapply(o_main_coords, function(x) return(c(x[1], x[2], x[3],.48)))
+  i=1
+for(t in levels(as.factor(plots_bnd$Treatment))){
+  tmp_pcf = mortality_pcf_marks[[t]]
+  par(fig = main_coords[[i]],new=TRUE)
+  plot(tmp_pcf, xlim = c(0,100), legend = FALSE, lwd=1, axes=FALSE, main = '', ylim = c(0.5,2))
+  box()
+  axis(1,at=(0:4)*20)
+  if(t == 'Control') {axis(2)
+    mtext(expression(italic(g)[italic('mor,est')]*' '*(italic(r))), side=2, line=3)}
+  mtext(paste0(letters[i+4], '. ',t), 3, adj=0.1, line=-1.2, cex=0.8)
+  i=i+1
+}
+mtext('distance (m)', outer=TRUE, side=1, line = 3)
+
+```
+
+
+\newpage
+
+# Literature Cited
+
+
+
+
